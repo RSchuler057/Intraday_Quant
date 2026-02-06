@@ -1,0 +1,1 @@
+#Rolling returns volatility, vwap distance, etc. Ideally pure functions.

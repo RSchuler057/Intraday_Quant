@@ -1,0 +1,6 @@
+#Human editable experiment settings.
+
+trading:
+  bar_minutes: 5
+  initial_capital: 1000
+  

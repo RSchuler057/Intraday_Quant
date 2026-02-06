@@ -1,0 +1,1 @@
+#Loads feature table and labels, splits data properly, trains the model, saves model artifact, and produces a training report.
