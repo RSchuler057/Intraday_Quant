@@ -3,4 +3,5 @@
 trading:
   bar_minutes: 5
   initial_capital: 1000
+  trade_cost: 0.50
   

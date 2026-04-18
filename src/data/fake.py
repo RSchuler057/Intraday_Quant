@@ -1,7 +1,7 @@
 #Creates fake bars for testing purpoeses
 import random
 from datetime import datetime, timedelta
-from data.types import Bar
+from src.data.bar_types import Bar
 
 def make_fake_bars(bar_minutes: int, num_bars: int, seed: int = 0) -> list[Bar]:
     rng = random.Random(seed)

@@ -6,6 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "intraday-quant"
 version = "0.1.0"
 requires-python = ">=3.10"
+dependencies = [
+    "PyYAML>=6.0",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}
