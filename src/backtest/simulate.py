@@ -21,12 +21,18 @@ def simulate_positions(bars: list[Bar], positions: list[int], initial_capital: f
         ts = bars[i].ts
 
         if positions[i] == 1:
-            equity = equity_list[-1] * (1 + raw_return)
+            if equity_list[-1] * (1 + raw_return) > 0:
+                equity = equity_list[-1] * (1 + raw_return)
+            else:
+                equity = 0
         else:
             equity = equity_list[-1]
 
         if positions[i] != positions[i-1]:
-            equity -= trade_cost
+            if equity - trade_cost >= 0:
+                equity -= trade_cost
+            else:
+                equity = 0
 
         timestamps.append(ts)
         equity_list.append(equity)

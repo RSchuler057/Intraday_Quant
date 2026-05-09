@@ -9,7 +9,7 @@ def make_fake_bars(bar_minutes: int, num_bars: int, seed: int = 0) -> list[Bar]:
     ts = datetime(2026, 2, 4, 9, 30)
     last_close = 100.0
     
-    for i in range(num_bars): 
+    for _ in range(num_bars): 
         open_price = last_close
         pct = rng.uniform(-0.002, 0.002)
         wiggle = rng.uniform(0, 0.001)

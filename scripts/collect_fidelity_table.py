@@ -1,0 +1,757 @@
+from __future__ import annotations
+import csv
+import time
+import re
+import subprocess
+import socket
+from pathlib import Path
+from datetime import datetime, time as dt_time
+from zoneinfo import ZoneInfo
+from dataclasses import dataclass
+from playwright.sync_api import sync_playwright, Page
+
+@dataclass
+class SweepStats:
+    added: int = 0
+    duplicates: int = 0
+    failed_switches: int = 0
+    missing_bars: int = 0
+    invalid_bars: int = 0
+    skipped_symbol_mismatch: int = 0
+
+EDGE_DEBUG_PORT = 9222
+EDGE_DEBUG_URL = f"http://localhost:{EDGE_DEBUG_PORT}"
+EDGE_USER_DATA_DIR = Path.home() / "edge_debug_profile"
+EDGE_PATHS = [r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe", r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",]
+
+SYMBOLS = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "TSLA", "SPY", "WMT", "GME", "MGNI"]
+INTERVAL = "5min"
+MARKET_TZ = ZoneInfo("America/New_York")
+COLLECTION_START = dt_time(9, 30)
+COLLECTION_END = dt_time(16, 10)
+
+POLL_SECONDS = 180
+RESTART_EVERY_N_SWEEPS = 10
+RAW_LIVE_DIR = Path("data/raw/live")
+FIDELITY_URL = "https://digital.fidelity.com/ftgw/digital/traderplus"
+FIDELITY_TS_PATTERN = re.compile(r"^\d{2}/\d{2}/\d{4}\s+\d{1,2}:\d{2}\s+(AM|PM)$")
+
+LOG_DIR = Path("data/logs")
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+def is_port_open(host: str = "127.0.0.1", port: int = EDGE_DEBUG_PORT) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            return True
+    except OSError:
+        return False
+    
+def find_edge_executable() -> str | None:
+    for path in EDGE_PATHS:
+        if Path(path).exists():
+            return path
+    return None
+
+def start_edge_debug():
+    if is_port_open():
+        log("Edge debug session already running.")
+        return None
+    
+    edge_path = find_edge_executable()
+
+    if edge_path is None:
+        log("Could not find Microsoft Edge executable.")
+        return None
+    
+    EDGE_USER_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    cmd = [edge_path, f"--remote-debugging-port={EDGE_DEBUG_PORT}", f"--user-data-dir={EDGE_USER_DATA_DIR}", f"--new-window", FIDELITY_URL]
+
+    log("Starting Edge debug session...")
+    edge_process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    for _ in range(20):
+        if is_port_open():
+            log("Edge debug session started.")
+            return edge_process
+        time.sleep(1)
+
+    log("Edge debug session did not start in time.")
+    
+    try:
+        edge_process.terminate()
+    except Exception:
+        pass
+
+    return None
+
+def connect_and_prepare_page(p):
+    edge_process = start_edge_debug()
+
+    if not is_port_open():
+        log("Edge debug port is not open. Cannot connect.")
+        return None, None, None
+    
+    try:
+        browser = p.chromium.connect_over_cdp(EDGE_DEBUG_URL)
+    except Exception as e:
+        log(f"Could not connect to Edge debug session: {e}")
+        return None, None, edge_process
+    
+    page = ensure_fidelity_page(browser)
+
+    if page is None:
+        log("Could not create or find Fidelity page.")
+        return browser, None, edge_process
+    
+    wait_for_trader_ready(page)
+
+    return browser, page, edge_process
+
+def ensure_fidelity_page(browser):
+    page = get_fidelity_page(browser)
+
+    if page is not None:
+        log(f"Using existing Fidelity page: {page.url}")
+        return page
+    
+    log("No Fidelity page found. Opening Fidelity Trader+.")
+
+    context = browser.contexts[0] if browser.contexts else browser.new_context()
+    page = context.new_page()
+    page.goto(FIDELITY_URL, wait_until="domcontentloaded", timeout=60000)
+    return page
+
+def trader_page_ready(page: Page) -> bool:
+    try:
+        body = page.locator("body").inner_text(timeout=5000).lower()
+        return ("trading dashboard" in body or "symbol search box" in body or "positions" in body)
+    except Exception:
+        return False
+    
+def wait_for_trader_ready(page: Page) -> bool:
+    log("Waiting for Fidelity Trader+ to become ready...")
+    login_click_attempts = 0
+    max_login_click_attempts = 3
+
+    while True:
+        if trader_page_ready(page):
+            log(f"Fidelity Trader+ is ready.")
+            return True
+        
+        if login_click_attempts < max_login_click_attempts:
+            if try_click_login_button(page):
+                login_click_attempts += 1
+        else:
+            log("Login button was clicked several times. Waiting for manual login if needed.")
+        time.sleep(15)
+
+def try_click_login_button(page: Page) -> bool:
+    possible_buttons = [
+        page.get_by_role("button", name="Log in"),
+        page.get_by_role("button", name="Login"),
+        page.get_by_role("button", name="Continue"),
+        page.locator('button:has-text("Log in")').first,
+        page.locator('button:has-text("Login")').first,
+        page.locator('button:has-text("Continue")').first,
+    ]
+
+    for button in possible_buttons:
+        try:
+            if button.count() == 0:
+                continue
+
+            button.wait_for(state="visible", timeout=1500)
+            button.click(force=True)
+            log("Clicked login/continue button.")
+            page.wait_for_timeout(5000)
+            return True
+        
+        except Exception:
+            continue
+    
+    return False
+
+def restart_edge_debug(p, browser, edge_process):
+    log("Restarting Edge debug session to control memory usage...")
+
+    stop_edge_debug(browser, edge_process)
+
+    browser, page, edge_process = connect_and_prepare_page(p)
+
+    if browser is None or page is None:
+        log("Failed to restart Edge debug session.")
+        return None, None, edge_process
+    
+    log("Edge debug session restarted successfully.")
+    return browser, page, edge_process
+    
+def stop_edge_debug(browser, edge_process) -> None:
+    log("Stopping Edge debug session...")
+
+    try:
+        if browser is not None:
+            browser.close()
+    except Exception as e:
+        log(f"Browser close failed: {e}")
+
+    if edge_process is not None:
+        try:
+            subprocess.run(["taskkill", "/PID", str(edge_process.pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,)
+            log("Requested termination of Edge process tree.")
+        except Exception as e:
+            log(f"taskkill process-tree terminate failed: {e}")
+        
+        try:
+            edge_process.wait(timeout=5)
+        except Exception:
+            pass
+    
+    kill_edge_debug_profile()
+    
+    time.sleep(5)
+
+def kill_edge_debug_profile() -> None:
+    profile = str(EDGE_USER_DATA_DIR)
+
+    ps_command = (
+        "Get-CimInstance Win32_Process "
+        "-Filter \"name = 'msedge.exe'\" | "
+        f"Where-Object {{ $_.CommandLine -like '*{profile}*' }} | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+    )
+
+    try:
+        subprocess.run(["powershell", "-NoProfile", "-Command", ps_command], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,)
+        log("Requested terminated of Edge debug-profile processes.")
+    except Exception as e:
+        log(f"Failed to terminate Edge debug profile processes: {e}")
+
+def now_market_time() -> datetime:
+    return datetime.now(MARKET_TZ)
+
+def is_weekday(dt: datetime) -> bool:
+    return dt.weekday() < 5
+
+def is_collection_time() -> bool:
+    now = now_market_time()
+
+    if not is_weekday(now):
+        return False
+    
+    return COLLECTION_START <= now.time() <= COLLECTION_END
+
+def clean_number(value: str) -> str:
+    return value.replace(",", "").strip()
+
+
+def output_path(symbol: str) -> Path:
+    RAW_LIVE_DIR.mkdir(parents=True, exist_ok=True)
+    return RAW_LIVE_DIR / f"{symbol}_{INTERVAL}_live.csv"
+
+
+def ensure_csv_header(path: Path) -> None:
+    if not path.exists():
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Date", "Open", "High", "Low", "Close", "Volume"])
+
+
+def load_seen_timestamps(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+
+    seen: set[str] = set()
+
+    with path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+
+        if reader.fieldnames is None or "Date" not in reader.fieldnames:
+            log(f"WARNING: {path} missing Date header. Ignoring existing timestamps.")
+            return seen
+        
+        for row in reader:
+            ts = row.get("Date")
+            if ts:
+                seen.add(ts)
+
+    return seen
+
+
+def append_bar(path: Path, bar: dict[str, str]) -> None:
+    ensure_csv_header(path)
+
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            bar["Date"],
+            bar["Open"],
+            bar["High"],
+            bar["Low"],
+            bar["Close"],
+            bar["Volume"],
+        ])
+
+def looks_like_fidelity_timestamp(value: str) -> bool:
+    return bool(FIDELITY_TS_PATTERN.match(value.strip()))
+
+def normalize_fidelity_timestamp(ts: str) -> str | None:
+    ts = ts.strip()
+
+    if not looks_like_fidelity_timestamp(ts):
+        return None
+
+    try:
+        dt_local = datetime.strptime(ts, "%m/%d/%Y %I:%M %p")
+    except ValueError:
+        return None
+
+    dt_local = dt_local.replace(tzinfo=MARKET_TZ)
+    dt_utc = dt_local.astimezone(ZoneInfo("UTC"))
+
+    return dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+def get_fidelity_page(browser):
+    for context in browser.contexts:
+        for candidate in context.pages:
+            try:
+                url = candidate.url.lower()
+
+                try:
+                    title = candidate.title().lower()
+                except Exception:
+                    title = ""
+
+                try:
+                    body = candidate.locator("body").inner_text(timeout=3000).lower()
+                except Exception:
+                    body = ""
+
+                looks_like_fidelity = (
+                    "fidelity.com" in url
+                    or "traderplus" in url
+                    or "fidelity" in title
+                    or "trader+" in body
+                    or "trading dashboard" in body
+                    or "symbol search box" in body
+                )
+
+                if looks_like_fidelity:
+                    return candidate
+
+            except Exception as e:
+                log(f"Skipping page during Fidelity lookup: {e}")
+                continue
+
+    return None
+
+def page_is_healthy(page: Page) -> bool:
+    try:
+        page.locator("body").inner_text(timeout=5000)
+        return True
+    except Exception:
+        return False
+    
+def find_chart_table(page: Page):
+    tables = page.locator("table")
+
+    for i in range(tables.count()):
+        table = tables.nth(i)
+        text = table.inner_text(timeout=5000)
+
+        if (
+            "Date" in text
+            and "Open" in text
+            and "High" in text
+            and "Low" in text
+            and "Close" in text
+            and "Volume" in text
+        ):
+            return table
+
+    return None
+
+def extract_ohlcv_rows(parts: list[str], data_start: int) -> list[list[str]]:
+    rows: list[list[str]] = []
+
+    # Find every location where a new row starts.
+    timestamp_indexes = []
+
+    for i in range(data_start, len(parts)):
+        if looks_like_fidelity_timestamp(parts[i]):
+            timestamp_indexes.append(i)
+
+    for idx, start in enumerate(timestamp_indexes):
+        end = timestamp_indexes[idx + 1] if idx + 1 < len(timestamp_indexes) else len(parts)
+        row = parts[start:end]
+
+        # Expected possibilities:
+        # 8 fields: Date, O, H, L, C, %Change, %ChangeVsAvg, Volume
+        # 7 fields: Date, O, H, L, C, %Change, Volume
+        if len(row) >= 7:
+            rows.append(row)
+
+    return rows
+
+def read_completed_bar(page: Page) -> dict[str, str] | None:
+    if not ensure_table_view(page):
+        return None
+
+    table = wait_for_chart_table(page, timeout_seconds=10)
+
+    if table is None:
+        log("DEBUG: Chart table not found after waiting.")
+        return None
+
+    text = table.inner_text(timeout=5000)
+    parts = [part.strip() for part in text.splitlines() if part.strip()]
+
+    expected_header = [
+        "Date",
+        "Open",
+        "High",
+        "Low",
+        "Close",
+        "% Change",
+        "% Change vs Average",
+        "Volume",
+    ]
+
+    if len(parts) < 16:
+        log(f"DEBUG: Not enough table parts. parts={len(parts)}")
+        log(parts[:30])
+        return None
+
+    # Find where the real chart header begins.
+    header_start = -1
+    for i in range(len(parts) - len(expected_header) + 1):
+        if parts[i:i + len(expected_header)] == expected_header:
+            header_start = i
+            break
+
+    if header_start == -1:
+        log("DEBUG: Could not find chart header in table text.")
+        log(parts[:40])
+        return None
+
+    data_start = header_start + len(expected_header)
+
+    rows = extract_ohlcv_rows(parts, data_start)
+
+    if len(rows) < 2:
+        log(f"DEBUG: Not enough valid OHLCV rows found. rows={len(rows)}")
+        log(f"DEBUG table parts sample: {parts[data_start:data_start + 40]}")
+        return None
+
+    row = rows[0]
+
+    raw_date = row[0]
+    normalized_date = normalize_fidelity_timestamp(raw_date)
+
+    if normalized_date is None:
+        log(f"DEBUG: Invalid timestamp in parsed row: {row}")
+        return None
+
+    # Volume is always the final value in the row, regardless of whether Fidelity included one or two percent-change columns.
+    return {
+        "Date": normalized_date,
+        "Open": clean_number(row[1]),
+        "High": clean_number(row[2]),
+        "Low": clean_number(row[3]),
+        "Close": clean_number(row[4]),
+        "Volume": clean_number(row[-1]),
+    }
+
+def is_valid_bar(bar: dict[str, str]) -> bool:
+    required = ["Date", "Open", "High", "Low", "Close", "Volume"]
+
+    for field in required:
+        if field not in bar or bar[field] == "":
+            return False
+
+    try:
+        open_price = float(bar["Open"])
+        high_price = float(bar["High"])
+        low_price = float(bar["Low"])
+        close_price = float(bar["Close"])
+        volume = int(bar["Volume"])
+    except ValueError:
+        return False
+
+    if open_price <= 0 or high_price <= 0 or low_price <= 0 or close_price <= 0:
+        return False
+
+    if volume < 0:
+        return False
+
+    if high_price < low_price:
+        return False
+
+    if not (low_price <= open_price <= high_price):
+        return False
+
+    if not (low_price <= close_price <= high_price):
+        return False
+
+    return True
+
+def page_matches_symbol(page: Page, symbol: str) -> bool:
+    try:
+        body = page.locator("body").inner_text(timeout=5000)
+    except Exception:
+        return False
+
+    return symbol in body
+
+def collect_symbol(page: Page, symbol: str, seen: set[str]) -> str:
+    path = output_path(symbol)
+    ensure_csv_header(path)
+
+    if not page_matches_symbol(page, symbol):
+        log(f"[{symbol}] Page symbol mismatch. Skipping collection.")
+        return "symbol_mismatch"
+
+    bar = read_completed_bar(page)
+
+    if bar is None:
+        log(f"[{symbol}] No completed bar found.")
+        return "missing"
+
+    if not is_valid_bar(bar):
+        log(f"[{symbol}] Invalid bar, skipping: {bar}")
+        return "invalid"
+
+    ts = bar["Date"]
+
+    if ts in seen:
+        log(f"[{symbol}] Already seen {ts}")
+        return "duplicate"
+
+    append_bar(path, bar)
+    seen.add(ts)
+
+    log(
+        f"[{symbol}] Added {ts} "
+        f"O={bar['Open']} H={bar['High']} "
+        f"L={bar['Low']} C={bar['Close']} V={bar['Volume']}"
+    )
+
+    return "added"
+
+def switch_symbol(page: Page, symbol: str) -> bool:
+    selector = 'input[aria-label="symbol search box"]'
+
+    try:
+        symbol_input = page.locator(selector).first
+        symbol_input.wait_for(state="visible", timeout=5000)
+
+        # Avoid normal click because Fidelity's cover element intercepts it.
+        symbol_input.focus()
+        page.keyboard.press("Control+A")
+        page.keyboard.type(symbol)
+        page.keyboard.press("Enter")
+
+        return wait_for_symbol_update(page, symbol)
+
+    except Exception as e:
+        log(f"[{symbol}] Failed to switch symbol: {e}")
+        return False
+
+def wait_for_symbol_update(page: Page, symbol: str) -> bool:
+    page.wait_for_timeout(1000)
+
+    body = page.locator("body").inner_text(timeout=5000)
+
+    if symbol not in body:
+        log(f"[{symbol}] Symbol switch failed: symbol not found in page body.")
+        return False
+
+    if not ensure_table_view(page):
+        log(f"[{symbol}] Symbol switch failed: could not enable table view.")
+        return False
+
+    table = wait_for_chart_table(page, timeout_seconds=10)
+
+    if table is None:
+        log(f"[{symbol}] Symbol switch failed: chart table not ready.")
+        return False
+
+    return True
+
+def ensure_table_view(page: Page) -> bool:
+    # If the chart table is already visible, no need to click anything.
+    if find_chart_table(page) is not None:
+        return True
+
+    table_buttons = [
+        page.get_by_role("button", name="Table"),
+        page.get_by_role("button", name="Table View"),
+        page.locator('button[aria-label*="Table"]').first,
+        page.locator('button:has-text("Table")').first,
+    ]
+
+    for button in table_buttons:
+        try:
+            if button.count() == 0:
+                continue
+
+            button.wait_for(state="visible", timeout=2000)
+            button.click(force=True)
+            page.wait_for_timeout(1000)
+
+            if find_chart_table(page) is not None:
+                return True
+
+        except Exception:
+            continue
+
+    log("DEBUG: Could not switch to table view.")
+    return False
+
+def wait_for_chart_table(page: Page, timeout_seconds: int = 10):
+    deadline = time.time() + timeout_seconds
+
+    while time.time() < deadline:
+        table = find_chart_table(page)
+
+        if table is not None:
+            return table
+
+        page.wait_for_timeout(500)
+
+    return None
+
+def log(message: str) -> None:
+    now = datetime.now()
+    line = f"[{now:%Y-%m-%d %H:%M:%S}] {message}"
+    log_path = LOG_DIR / f"collector_{now:%Y-%m-%d}.log"
+    with log_path.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+def main() -> None:
+    log("Starting Fidelity table collector...")
+
+    with sync_playwright() as p:
+        browser, page, edge_process = connect_and_prepare_page(p)
+
+        if browser is None or page is None:
+            log("Could not prepare browser/page. Exiting collector.")
+            return
+        
+        log(f"Using Fidelity page: {page.url}")
+        log("Collector starts in 20 seconds...")
+        time.sleep(20)
+
+        seen_by_symbol: dict[str, set[str]] = {}
+
+        for symbol in SYMBOLS:
+            path = output_path(symbol)
+            ensure_csv_header(path)
+            seen_by_symbol[symbol] = load_seen_timestamps(path)
+        try:
+            sweep_count = 0
+            consecutive_bad_sweeps = 0
+            while True:
+                if not is_collection_time():
+                    now = now_market_time()
+                    log(f"Market collection inactive at {now:%Y-%m-%d %H:%M:%S %Z}. Waiting...")
+                    time.sleep(240)
+                    continue
+
+                started = datetime.now()
+                log(f"\nPolling at {started:%Y-%m-%d %H:%M:%S}")
+
+                if not page_is_healthy(page):
+                    log("Current page appears stale. Restarting browser.")
+                    browser, page, edge_process = restart_edge_debug(p, browser, edge_process)
+
+                    if browser is None or page is None:
+                        log("Could not recover stale page. Waiting before retry.")
+                        time.sleep(60)
+                        continue
+                
+                stats = SweepStats()
+
+                for symbol in SYMBOLS:
+                    if not switch_symbol(page, symbol):
+                        stats.failed_switches += 1
+                        continue
+
+                    if not ensure_table_view(page):
+                        log(f"[{symbol}] Could not open table view, skipping.")
+                        stats.missing_bars += 1
+                        continue
+                        
+                    try:
+                        result = collect_symbol(page, symbol, seen_by_symbol[symbol])
+                    except Exception as e:
+                        log(f"[{symbol}] Unexpected collection error: {e}")
+                        stats.missing_bars += 1
+                        continue
+
+                    if result == "added":
+                        stats.added += 1
+                    elif result == "duplicate":
+                        stats.duplicates += 1
+                    elif result == "missing":
+                        stats.missing_bars += 1
+                    elif result == "invalid":
+                        stats.invalid_bars += 1
+                    elif result == "symbol_mismatch":
+                        stats.skipped_symbol_mismatch += 1
+
+                    page.wait_for_timeout(1000)
+
+                sweep_failed = (stats.failed_switches > 0 or stats.missing_bars >= len(SYMBOLS) or stats.skipped_symbol_mismatch > 0)
+                if sweep_failed:
+                    consecutive_bad_sweeps += 1
+                else:
+                    consecutive_bad_sweeps = 0
+
+                log(
+                    "Sweep complete: "
+                    f"added={stats.added}, "
+                    f"duplicates={stats.duplicates}, "
+                    f"failed_switches={stats.failed_switches}, "
+                    f"missing_bars={stats.missing_bars}, "
+                    f"invalid_bars={stats.invalid_bars}, "
+                    f"symbol_mismatches={stats.skipped_symbol_mismatch}"
+                )
+
+                if consecutive_bad_sweeps >= 2:
+                    log("Multiple bad sweeps detected. Restarting browser.")
+                    browser, page, edge_process = restart_edge_debug(p, browser, edge_process)
+
+                    if browser is None or page is None:
+                        log("Bad-sweep restart failed. Waiting before retry.")
+                        time.sleep(60)
+                        browser, page, edge_process = connect_and_prepare_page(p)
+
+                        if browser is None or page is None:
+                            log("Reconnect failed after bad-sweep restart.")
+                            time.sleep(POLL_SECONDS)
+                            continue
+                    
+                    consecutive_bad_sweeps = 0
+
+                sweep_count += 1
+                if sweep_count % RESTART_EVERY_N_SWEEPS == 0:
+                    browser, page, edge_process = restart_edge_debug(p, browser, edge_process)
+
+                    if browser is None or page is None:
+                        log("Restart failed. Waiting before retry.")
+                        time.sleep(60)
+                        browser, page, edge_process = connect_and_prepare_page(p)
+
+                        if browser is None or page is None:
+                            log("Reconnect failed. Skipping next cycle.")
+                            time.sleep(POLL_SECONDS)
+                            continue
+                time.sleep(POLL_SECONDS)
+
+        except KeyboardInterrupt:
+            log("\nCollector stopped by user.")
+            stop_edge_debug(browser, edge_process)
+
+if __name__ == "__main__":
+    main()

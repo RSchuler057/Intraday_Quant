@@ -1,1 +1,0 @@
-Data is going to go raw -> interim -> processed where processed is the training-ready data.

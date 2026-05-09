@@ -14,3 +14,12 @@ def always_in_strategy(bars: list[Bar]) -> list[int]:
     for _ in range(1, len(bars)):
         positions.append(1)
     return positions
+
+def momentum_strategy(bars: list[Bar]) -> list[int]:
+    positions = [0, 0]
+    for i in range(2, len(bars)):
+        if bars[i-1].close > bars[i-2].close:
+            positions.append(1)
+        else:
+            positions.append(0)
+    return positions
