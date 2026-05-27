@@ -11,10 +11,9 @@ def main():
     settings = load_settings()
 
     trading = settings["trading"]
-    bar_minutes = trading["bar_minutes"]
     initial_capital = trading["initial_capital"]
     trade_cost = trading["trade_cost"]
-    bars = load_processed_data("data/processed/AAPL2026_processed.csv")
+    bars = load_processed_data("data/processed/GME_5min_processed.csv")
     
     strategies = {
         "Alternating": alternating_strategy,

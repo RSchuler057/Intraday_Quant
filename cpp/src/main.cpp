@@ -3,6 +3,7 @@
 //   normalize_data <input.csv> <output.csv> <symbol> <interval>
 //   normalize_data --batch <raw_dir> <processed_dir>
 //   normalize_data --merge <incoming_raw_dir> <processed_dir>
+//   normalize_data --normalize-processed <processed_dir>
 
 #include <algorithm>
 #include <cctype>
@@ -31,6 +32,7 @@ struct MergeStats {
     std::size_t incoming_rows = 0;
     std::size_t final_rows = 0;
     std::size_t duplicates_removed = 0;
+    std::size_t conflict_rows = 0;
     std::size_t skipped_rows = 0;
 };
 
@@ -58,6 +60,35 @@ std::string trim(const std::string& s) {
 
     return out;
 }
+
+std::string normalize_timestamp(const std::string& input) {
+    std::string ts = trim(input);
+
+    // Canonical project timestamp format:
+    // 2026-05-08T13:40:00Z
+    // This converts 2026-05-08T13:40:00.000Z to 2026-05-08T13:40:00Z.
+    const std::size_t dot_pos = ts.find('.');
+    const std::size_t z_pos = ts.find('Z');
+
+    if (dot_pos != std::string::npos && z_pos != std::string::npos && dot_pos < z_pos) {
+        ts = ts.substr(0, dot_pos) + "Z";
+    }
+
+    return ts;
+}
+
+std::string bar_key(const BarRecord& bar) {
+    return bar.symbol + "|" + normalize_timestamp(bar.ts) + "|" + bar.interval;
+}
+
+bool same_ohlcv(const BarRecord& a, const BarRecord& b) {
+    return a.open == b.open
+        && a.high == b.high
+        && a.low == b.low
+        && a.close == b.close
+        && a.volume == b.volume;
+}
+
 
 std::vector<std::string> split_csv_line(const std::string& line) {
     std::vector<std::string> fields;
@@ -171,7 +202,7 @@ bool is_valid_bar(const BarRecord& bar) {
 }
 
 BarRecord normalize_raw_row(const std::vector<std::string>& row, const std::unordered_map<std::string, std::size_t>& header_map, const std::string& symbol, const std::string& interval) {
-    const std::string ts = get_required_field(row, header_map, "Date");
+    const std::string ts = normalize_timestamp(get_required_field(row, header_map, "Date"));
     const std::string open_str = get_required_field(row, header_map, "Open");
     const std::string high_str = get_required_field(row, header_map, "High");
     const std::string low_str = get_required_field(row, header_map, "Low");
@@ -197,7 +228,7 @@ BarRecord normalize_raw_row(const std::vector<std::string>& row, const std::unor
 BarRecord parse_processed_row(const std::vector<std::string>& row, const std::unordered_map<std::string, std::size_t>& header_map) {
     BarRecord bar{
         get_required_field(row, header_map, "symbol"),
-        get_required_field(row, header_map, "ts"),
+        normalize_timestamp(get_required_field(row, header_map, "ts")),
         std::stod(get_required_field(row, header_map, "open")),
         std::stod(get_required_field(row, header_map, "high")),
         std::stod(get_required_field(row, header_map, "low")),
@@ -334,26 +365,96 @@ void write_bars(const fs::path& output_path, const std::vector<BarRecord>& bars)
     }
 }
 
-std::vector<BarRecord> dedupe_by_timestamp(const std::vector<BarRecord>& bars, std::size_t& duplicates_removed) {
-    // std::map keeps timestamps sorted. Later entries overwrite earlier entries with the same timestamp.
-    std::map<std::string, BarRecord> by_timestamp;
+std::vector<BarRecord> dedupe_existing_bars_keep_first(
+    const std::vector<BarRecord>& bars,
+    std::size_t& duplicates_removed,
+    std::size_t& conflict_rows
+) {
+    // Used for --normalize-processed.
+    // If duplicate keys exist inside a processed file, the first existing row wins.
+    std::map<std::string, BarRecord> by_key;
 
-    for (const auto& bar : bars) {
-        auto [it, inserted] = by_timestamp.insert({bar.ts, bar});
+    for (auto bar : bars) {
+        bar.ts = normalize_timestamp(bar.ts);
+        const std::string key = bar_key(bar);
+
+        auto [it, inserted] = by_key.insert({key, bar});
         if (!inserted) {
-            it->second = bar;
             ++duplicates_removed;
+            if (!same_ohlcv(it->second, bar)) {
+                ++conflict_rows;
+                std::cerr << "Conflict inside processed file, kept first row for " << key << '\n';
+            }
         }
     }
 
     std::vector<BarRecord> deduped;
-    deduped.reserve(by_timestamp.size());
+    deduped.reserve(by_key.size());
 
-    for (const auto& [ts, bar] : by_timestamp) {
+    for (const auto& [key, bar] : by_key) {
         deduped.push_back(bar);
     }
 
+    std::sort(deduped.begin(), deduped.end(), [](const BarRecord& a, const BarRecord& b) {
+        if (a.symbol != b.symbol) return a.symbol < b.symbol;
+        if (a.ts != b.ts) return a.ts < b.ts;
+        return a.interval < b.interval;
+    });
+
     return deduped;
+}
+
+std::vector<BarRecord> merge_keep_existing(
+    const std::vector<BarRecord>& existing,
+    const std::vector<BarRecord>& incoming,
+    std::size_t& duplicates_removed,
+    std::size_t& conflict_rows
+) {
+    // Existing processed rows win. Incoming rows only fill missing keys.
+    std::map<std::string, BarRecord> by_key;
+
+    for (auto bar : existing) {
+        bar.ts = normalize_timestamp(bar.ts);
+        const std::string key = bar_key(bar);
+
+        auto [it, inserted] = by_key.insert({key, bar});
+        if (!inserted) {
+            ++duplicates_removed;
+            if (!same_ohlcv(it->second, bar)) {
+                ++conflict_rows;
+                std::cerr << "Conflict inside existing processed data, kept first row for " << key << '\n';
+            }
+        }
+    }
+
+    for (auto bar : incoming) {
+        bar.ts = normalize_timestamp(bar.ts);
+        const std::string key = bar_key(bar);
+
+        auto [it, inserted] = by_key.insert({key, bar});
+        if (!inserted) {
+            ++duplicates_removed;
+            if (!same_ohlcv(it->second, bar)) {
+                ++conflict_rows;
+                std::cerr << "Conflict kept existing for " << key << '\n';
+            }
+        }
+    }
+
+    std::vector<BarRecord> merged;
+    merged.reserve(by_key.size());
+
+    for (const auto& [key, bar] : by_key) {
+        merged.push_back(bar);
+    }
+
+    std::sort(merged.begin(), merged.end(), [](const BarRecord& a, const BarRecord& b) {
+        if (a.symbol != b.symbol) return a.symbol < b.symbol;
+        if (a.ts != b.ts) return a.ts < b.ts;
+        return a.interval < b.interval;
+    });
+
+    return merged;
 }
 
 fs::path processed_path_for(const fs::path& processed_dir, const FileMeta& meta) {
@@ -380,13 +481,9 @@ MergeStats merge_single_file(const fs::path& incoming_raw_path, const fs::path& 
     auto existing = read_processed_bars(processed_path, skipped);
     auto incoming = read_raw_bars(incoming_raw_path, symbol, interval, skipped);
 
-    std::vector<BarRecord> combined;
-    combined.reserve(existing.size() + incoming.size());
-    combined.insert(combined.end(), existing.begin(), existing.end());
-    combined.insert(combined.end(), incoming.begin(), incoming.end());
-
     std::size_t duplicates_removed = 0;
-    auto merged = dedupe_by_timestamp(combined, duplicates_removed);
+    std::size_t conflict_rows = 0;
+    auto merged = merge_keep_existing(existing, incoming, duplicates_removed, conflict_rows);
     write_bars(processed_path, merged);
 
     std::cout << "\nIncoming file:      " << incoming_raw_path.string() << '\n';
@@ -397,9 +494,10 @@ MergeStats merge_single_file(const fs::path& incoming_raw_path, const fs::path& 
     std::cout << "Incoming rows:      " << incoming.size() << '\n';
     std::cout << "Final rows:         " << merged.size() << '\n';
     std::cout << "Duplicates removed: " << duplicates_removed << '\n';
+    std::cout << "Conflicts kept:     " << conflict_rows << '\n';
     std::cout << "Rows skipped:       " << skipped << '\n';
 
-    return MergeStats{existing.size(), incoming.size(), merged.size(), duplicates_removed, skipped};
+    return MergeStats{existing.size(), incoming.size(), merged.size(), duplicates_removed, conflict_rows, skipped};
 }
 
 bool is_csv_file(const fs::path& path) {
@@ -461,6 +559,7 @@ int run_merge_mode(const fs::path& incoming_dir, const fs::path& processed_dir) 
     std::size_t total_incoming = 0;
     std::size_t total_final = 0;
     std::size_t total_dupes = 0;
+    std::size_t total_conflicts = 0;
     std::size_t total_skipped = 0;
 
     for (const auto& entry : fs::directory_iterator(incoming_dir)) {
@@ -479,6 +578,7 @@ int run_merge_mode(const fs::path& incoming_dir, const fs::path& processed_dir) 
             total_incoming += stats.incoming_rows;
             total_final += stats.final_rows;
             total_dupes += stats.duplicates_removed;
+            total_conflicts += stats.conflict_rows;
             total_skipped += stats.skipped_rows;
         } catch (const std::exception& e) {
             ++files_failed;
@@ -494,6 +594,68 @@ int run_merge_mode(const fs::path& incoming_dir, const fs::path& processed_dir) 
     std::cout << "Incoming rows read: " << total_incoming << '\n';
     std::cout << "Final rows total:   " << total_final << '\n';
     std::cout << "Duplicates removed: " << total_dupes << '\n';
+    std::cout << "Conflicts kept:     " << total_conflicts << '\n';
+    std::cout << "Rows skipped:       " << total_skipped << '\n';
+
+    return files_failed == 0 ? 0 : 1;
+}
+
+int run_normalize_processed_mode(const fs::path& processed_dir) {
+    if (!fs::exists(processed_dir) || !fs::is_directory(processed_dir)) {
+        throw std::runtime_error("Processed directory does not exist: " + processed_dir.string());
+    }
+
+    std::size_t files_normalized = 0;
+    std::size_t files_failed = 0;
+    std::size_t total_rows_before = 0;
+    std::size_t total_rows_after = 0;
+    std::size_t total_dupes = 0;
+    std::size_t total_conflicts = 0;
+    std::size_t total_skipped = 0;
+
+    for (const auto& entry : fs::directory_iterator(processed_dir)) {
+        const fs::path path = entry.path();
+        if (!is_csv_file(path)) {
+            continue;
+        }
+
+        try {
+            std::size_t skipped = 0;
+            auto existing = read_processed_bars(path, skipped);
+
+            std::size_t duplicates_removed = 0;
+            std::size_t conflict_rows = 0;
+            auto normalized = dedupe_existing_bars_keep_first(existing, duplicates_removed, conflict_rows);
+
+            write_bars(path, normalized);
+
+            ++files_normalized;
+            total_rows_before += existing.size();
+            total_rows_after += normalized.size();
+            total_dupes += duplicates_removed;
+            total_conflicts += conflict_rows;
+            total_skipped += skipped;
+
+            std::cout << "\nProcessed file:     " << path.string() << '\n';
+            std::cout << "Rows before:        " << existing.size() << '\n';
+            std::cout << "Rows after:         " << normalized.size() << '\n';
+            std::cout << "Duplicates removed: " << duplicates_removed << '\n';
+            std::cout << "Conflicts kept:     " << conflict_rows << '\n';
+            std::cout << "Rows skipped:       " << skipped << '\n';
+        } catch (const std::exception& e) {
+            ++files_failed;
+            std::cerr << "Failed to normalize processed file " << path << ": " << e.what() << '\n';
+        }
+    }
+
+    std::cout << "\nNormalize processed summary\n";
+    std::cout << "---------------------------\n";
+    std::cout << "Files normalized:   " << files_normalized << '\n';
+    std::cout << "Files failed:       " << files_failed << '\n';
+    std::cout << "Rows before:        " << total_rows_before << '\n';
+    std::cout << "Rows after:         " << total_rows_after << '\n';
+    std::cout << "Duplicates removed: " << total_dupes << '\n';
+    std::cout << "Conflicts kept:     " << total_conflicts << '\n';
     std::cout << "Rows skipped:       " << total_skipped << '\n';
 
     return files_failed == 0 ? 0 : 1;
@@ -501,7 +663,18 @@ int run_merge_mode(const fs::path& incoming_dir, const fs::path& processed_dir) 
 
 void print_usage() {
     std::cerr
-        << "Usage:\n" << "  normalize_data <input.csv> <output.csv> <symbol> <interval>\n" << "  normalize_data --batch <raw_dir> <processed_dir>\n" << "  normalize_data --merge <incoming_raw_dir> <processed_dir>\n" << "normalize_data --validate <processed_dir>\n\n" << "Examples:\n" << "  normalize_data data/raw/AAPL_5min_raw.csv data/processed/AAPL_5min_processed.csv AAPL 5min\n" << "  normalize_data --batch data/raw data/processed\n" << "  normalize_data --merge data/incoming data/processed\n" << "normalize_data --validate data/processed";
+        << "Usage:\n"
+        << "  normalize_data <input.csv> <output.csv> <symbol> <interval>\n"
+        << "  normalize_data --batch <raw_dir> <processed_dir>\n"
+        << "  normalize_data --merge <incoming_raw_dir> <processed_dir>\n"
+        << "  normalize_data --normalize-processed <processed_dir>\n"
+        << "  normalize_data --validate <processed_dir>\n\n"
+        << "Examples:\n"
+        << "  normalize_data data/raw/AAPL_5min_raw.csv data/processed/AAPL_5min_processed.csv AAPL 5min\n"
+        << "  normalize_data --batch data/raw data/processed\n"
+        << "  normalize_data --merge data/raw/live data/processed\n"
+        << "  normalize_data --normalize-processed data/processed\n"
+        << "  normalize_data --validate data/processed\n";
 }
 
 } // namespace
@@ -510,6 +683,10 @@ int main(int argc, char* argv[]) {
     try {
         if (argc == 3 && std::string(argv[1]) == "--validate") {
             return run_validate_mode(argv[2]);
+        }
+
+        if (argc == 3 && std::string(argv[1]) == "--normalize-processed") {
+            return run_normalize_processed_mode(argv[2]);
         }
 
         if (argc == 4 && std::string(argv[1]) == "--batch") {

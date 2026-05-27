@@ -3,9 +3,10 @@ import csv
 import time
 import re
 import subprocess
+import shutil
 import socket
 from pathlib import Path
-from datetime import datetime, time as dt_time
+from datetime import datetime, time as dt_time, timedelta
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass
 from playwright.sync_api import sync_playwright, Page
@@ -30,11 +31,18 @@ MARKET_TZ = ZoneInfo("America/New_York")
 COLLECTION_START = dt_time(9, 30)
 COLLECTION_END = dt_time(16, 10)
 
-POLL_SECONDS = 180
-RESTART_EVERY_N_SWEEPS = 10
+BAR_MINUTES = 5
+BAR_DELAY_SECONDS = 15
+OUT_OF_HOURS_SLEEP_SECONDS = 300
+RESTART_EVERY_N_SWEEPS = 3
 RAW_LIVE_DIR = Path("data/raw/live")
 FIDELITY_URL = "https://digital.fidelity.com/ftgw/digital/traderplus"
 FIDELITY_TS_PATTERN = re.compile(r"^\d{2}/\d{2}/\d{4}\s+\d{1,2}:\d{2}\s+(AM|PM)$")
+
+CPP_EXE = Path("cpp/build/Debug/normalize_data.exe")
+LIVE_RAW_DIR = Path("data/raw/live")
+PROCESSED_DIR = Path("data/processed")
+LIVE_ARCHIVE_DIR = Path("data/raw/archive")
 
 LOG_DIR = Path("data/logs")
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -105,6 +113,8 @@ def connect_and_prepare_page(p):
         return browser, None, edge_process
     
     wait_for_trader_ready(page)
+
+    close_extra_pages(browser, page)
 
     return browser, page, edge_process
 
@@ -227,6 +237,23 @@ def kill_edge_debug_profile() -> None:
     except Exception as e:
         log(f"Failed to terminate Edge debug profile processes: {e}")
 
+def close_extra_pages(browser, keep_page) -> None:
+    closed = 0
+
+    for context in browser.contexts:
+        for page in list(context.pages):
+            if page == keep_page:
+                continue
+
+            try:
+                page.close()
+                closed += 1
+            except Exception as e:
+                log(f"Failed to close extra page: {e}")
+    
+    if closed > 0:
+        log(f"Closed {closed} extra browser page(s).")
+
 def now_market_time() -> datetime:
     return datetime.now(MARKET_TZ)
 
@@ -241,21 +268,46 @@ def is_collection_time() -> bool:
     
     return COLLECTION_START <= now.time() <= COLLECTION_END
 
+def next_trading_day_start(now: datetime) -> datetime:
+    candidate = now.replace(hour=COLLECTION_START.hour, minute=COLLECTION_START.minute, second=0, microsecond=0,)
+
+    if now >= candidate:
+        candidate += timedelta(days=1)
+
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    
+    return candidate
+
+def sleep_until_next_trading_day() -> None:
+    now = now_market_time()
+    start = next_trading_day_start(now)
+    seconds = max(0.0, (start - now).total_seconds())
+
+    log(f"Market closed. Collector idle until {start:%Y-%m-%d %H:%M:%S %Z}.")
+
+    time.sleep(seconds)
+
+def is_after_market_hours() -> bool:
+    now = now_market_time()
+
+    if now.weekday() >= 5:
+        return True
+    
+    return now.time() > COLLECTION_END
+
 def clean_number(value: str) -> str:
     return value.replace(",", "").strip()
-
 
 def output_path(symbol: str) -> Path:
     RAW_LIVE_DIR.mkdir(parents=True, exist_ok=True)
     return RAW_LIVE_DIR / f"{symbol}_{INTERVAL}_live.csv"
-
 
 def ensure_csv_header(path: Path) -> None:
     if not path.exists():
         with path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["Date", "Open", "High", "Low", "Close", "Volume"])
-
 
 def load_seen_timestamps(path: Path) -> set[str]:
     if not path.exists():
@@ -276,7 +328,6 @@ def load_seen_timestamps(path: Path) -> set[str]:
                 seen.add(ts)
 
     return seen
-
 
 def append_bar(path: Path, bar: dict[str, str]) -> None:
     ensure_csv_header(path)
@@ -393,15 +444,15 @@ def extract_ohlcv_rows(parts: list[str], data_start: int) -> list[list[str]]:
 
     return rows
 
-def read_completed_bar(page: Page) -> dict[str, str] | None:
+def read_recent_bars(page: Page) -> list[dict[str, str]]:
     if not ensure_table_view(page):
-        return None
+        return []
 
     table = wait_for_chart_table(page, timeout_seconds=10)
 
     if table is None:
         log("DEBUG: Chart table not found after waiting.")
-        return None
+        return []
 
     text = table.inner_text(timeout=5000)
     parts = [part.strip() for part in text.splitlines() if part.strip()]
@@ -419,11 +470,11 @@ def read_completed_bar(page: Page) -> dict[str, str] | None:
 
     if len(parts) < 16:
         log(f"DEBUG: Not enough table parts. parts={len(parts)}")
-        log(parts[:30])
-        return None
+        log(f"DEBUG table parts sample: {parts[:30]}")
+        return []
 
-    # Find where the real chart header begins.
     header_start = -1
+
     for i in range(len(parts) - len(expected_header) + 1):
         if parts[i:i + len(expected_header)] == expected_header:
             header_start = i
@@ -431,36 +482,41 @@ def read_completed_bar(page: Page) -> dict[str, str] | None:
 
     if header_start == -1:
         log("DEBUG: Could not find chart header in table text.")
-        log(parts[:40])
-        return None
+        log(f"DEBUG table parts sample: {parts[:40]}")
+        return []
 
     data_start = header_start + len(expected_header)
 
     rows = extract_ohlcv_rows(parts, data_start)
 
-    if len(rows) < 2:
-        log(f"DEBUG: Not enough valid OHLCV rows found. rows={len(rows)}")
+    if not rows:
+        log("DEBUG: No valid OHLCV rows found.")
         log(f"DEBUG table parts sample: {parts[data_start:data_start + 40]}")
-        return None
+        return []
 
-    row = rows[0]
+    bars: list[dict[str, str]] = []
 
-    raw_date = row[0]
-    normalized_date = normalize_fidelity_timestamp(raw_date)
+    for row in rows:
+        if len(row) < 7:
+            continue
 
-    if normalized_date is None:
-        log(f"DEBUG: Invalid timestamp in parsed row: {row}")
-        return None
+        normalized_date = normalize_fidelity_timestamp(row[0])
 
-    # Volume is always the final value in the row, regardless of whether Fidelity included one or two percent-change columns.
-    return {
-        "Date": normalized_date,
-        "Open": clean_number(row[1]),
-        "High": clean_number(row[2]),
-        "Low": clean_number(row[3]),
-        "Close": clean_number(row[4]),
-        "Volume": clean_number(row[-1]),
-    }
+        if normalized_date is None:
+            continue
+
+        bar = {
+            "Date": normalized_date,
+            "Open": clean_number(row[1]),
+            "High": clean_number(row[2]),
+            "Low": clean_number(row[3]),
+            "Close": clean_number(row[4]),
+            "Volume": clean_number(row[-1]),
+        }
+
+        bars.append(bar)
+
+    return bars
 
 def is_valid_bar(bar: dict[str, str]) -> bool:
     required = ["Date", "Open", "High", "Low", "Close", "Volume"]
@@ -495,6 +551,20 @@ def is_valid_bar(bar: dict[str, str]) -> bool:
 
     return True
 
+def bar_is_today(bar: dict[str, str]) -> bool:
+    ts = bar["Date"]
+
+    try:
+        dt_utc = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        log(f"Invalid timestamp while checking for bar date: {ts}")
+        return False
+    
+    dt_market = dt_utc.astimezone(MARKET_TZ)
+    today_market = now_market_time().date()
+
+    return dt_market.date() == today_market
+
 def page_matches_symbol(page: Page, symbol: str) -> bool:
     try:
         body = page.locator("body").inner_text(timeout=5000)
@@ -506,35 +576,51 @@ def page_matches_symbol(page: Page, symbol: str) -> bool:
 def collect_symbol(page: Page, symbol: str, seen: set[str]) -> str:
     path = output_path(symbol)
     ensure_csv_header(path)
+    seen.update(load_seen_timestamps(path))
 
     if not page_matches_symbol(page, symbol):
         log(f"[{symbol}] Page symbol mismatch. Skipping collection.")
         return "symbol_mismatch"
 
-    bar = read_completed_bar(page)
+    recent_bars = read_recent_bars(page)
 
-    if bar is None:
+    if not recent_bars:
         log(f"[{symbol}] No completed bar found.")
         return "missing"
 
-    if not is_valid_bar(bar):
-        log(f"[{symbol}] Invalid bar, skipping: {bar}")
-        return "invalid"
+    missing_bars: list[dict[str,str]] = []
 
-    ts = bar["Date"]
+    for bar in recent_bars:
+        ts = bar["Date"]
 
-    if ts in seen:
-        log(f"[{symbol}] Already seen {ts}")
+        if not bar_is_today(bar):
+            break
+
+        if ts in seen:
+            break
+
+        if not is_valid_bar(bar):
+            log(f"[{symbol}] Invalid bar while catching up, skipping: {bar}")
+            continue
+
+        missing_bars.append(bar)
+
+    if not missing_bars:
+        latest_ts = recent_bars[0]["Date"]
+        log(f"[{symbol}] Already seen through {latest_ts}")
         return "duplicate"
+    
+    missing_bars.reverse()
 
-    append_bar(path, bar)
-    seen.add(ts)
+    for bar in missing_bars:
+        ts = bar["Date"]
 
-    log(
-        f"[{symbol}] Added {ts} "
-        f"O={bar['Open']} H={bar['High']} "
-        f"L={bar['Low']} C={bar['Close']} V={bar['Volume']}"
-    )
+        append_bar(path, bar)
+        seen.add(ts)
+        log(f"[{symbol}] Added {ts} O={bar['Open']} H={bar['High']} L={bar['Low']} C={bar['Close']} V={bar['Volume']}")
+
+    if len(missing_bars) > 1:
+        log(f"[{symbol}] Caught up {len(missing_bars)} missing bars.")
 
     return "added"
 
@@ -621,6 +707,99 @@ def wait_for_chart_table(page: Page, timeout_seconds: int = 10):
 
     return None
 
+def time_until_next_bar_run(now: datetime) -> float:
+    minute = now.minute
+    second = now.second
+    microsecond = now.microsecond
+
+    minutes_past = minute % BAR_MINUTES
+    minutes_until_next = BAR_MINUTES - minutes_past
+
+    if minutes_past == 0 and second < BAR_DELAY_SECONDS:
+        next_run = now.replace(second=BAR_DELAY_SECONDS, microsecond=0)
+        return max(0.0, (next_run - now).total_seconds())
+    
+    next_run = now.replace(second=BAR_DELAY_SECONDS, microsecond=0)
+    next_run += timedelta(minutes=minutes_until_next)
+
+    return max(0.0, (next_run - now).total_seconds())
+
+def sleep_until_next_bar_run() -> None:
+    now = now_market_time()
+
+    if now.time() > COLLECTION_END or now.weekday() >= 5:
+        return
+
+    seconds = time_until_next_bar_run(now)
+    next_run = now + timedelta(seconds=seconds)
+    log(f"Next collection sweep scheduled for {next_run:%Y-%m-%d %H:%M:%S %Z}")
+    time.sleep(seconds)
+
+def run_cpp_command(args: list[str]) -> bool:
+    if not CPP_EXE.exists():
+        log(f"C++ executable not found: {CPP_EXE}")
+        return False
+    
+    cmd = [str(CPP_EXE)] + args
+
+    log(f"Running C++ command: {' '.join(cmd)}")
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300,)
+
+        if result.stdout:
+            log(result.stdout.strip())
+
+        if result.stderr:
+            log(f"C++ stderr: {result.stderr.strip()}")
+        
+        if result.returncode != 0:
+            log(f"C++ command failed with return code {result.returncode}")
+            return False
+
+        return True
+    
+    except Exception as e:
+        log(f"Failed to run C++ command: {e}")
+        return False
+    
+def archive_live_files() -> None:
+    today = now_market_time().strftime("%Y-%m-%d")
+    archive_dir = LIVE_ARCHIVE_DIR / today
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    moved = 0
+
+    for path in LIVE_RAW_DIR.glob("*.csv"):
+        destination = archive_dir / path.name
+
+        try:
+            shutil.move(str(path), str(destination))
+            moved += 1
+        except Exception as e:
+            log(f"Failed to archive {path}: {e}")
+    
+    log(f"Archived {moved} live files(s) to {archive_dir}")
+    
+def run_end_of_day_processing() -> bool:
+    log("Starting end-of-day live data processing...")
+
+    merge_ok = run_cpp_command(["--merge", str(LIVE_RAW_DIR), str(PROCESSED_DIR),])
+
+    if not merge_ok:
+        log("End-of-day merge failed. Live files were not archived.")
+        return False
+    
+    validate_ok = run_cpp_command(["--validate", str(PROCESSED_DIR)])
+
+    if not validate_ok:
+        log("Post-merge validation failed. Live files were not archived.")
+        return False
+    
+    log("End-of-day merge and validation succeeded.")
+    archive_live_files()
+    return True
+
 def log(message: str) -> None:
     now = datetime.now()
     line = f"[{now:%Y-%m-%d %H:%M:%S}] {message}"
@@ -632,43 +811,54 @@ def main() -> None:
     log("Starting Fidelity table collector...")
 
     with sync_playwright() as p:
-        browser, page, edge_process = connect_and_prepare_page(p)
-
-        if browser is None or page is None:
-            log("Could not prepare browser/page. Exiting collector.")
-            return
-        
-        log(f"Using Fidelity page: {page.url}")
-        log("Collector starts in 20 seconds...")
-        time.sleep(20)
-
+        browser = None
+        page = None
+        edge_process = None
+        sweep_count = 0
+        consecutive_bad_sweeps = 0
         seen_by_symbol: dict[str, set[str]] = {}
+        last_eod_processing_date: str | None = None
 
         for symbol in SYMBOLS:
             path = output_path(symbol)
             ensure_csv_header(path)
             seen_by_symbol[symbol] = load_seen_timestamps(path)
+            
         try:
-            sweep_count = 0
-            consecutive_bad_sweeps = 0
             while True:
                 if not is_collection_time():
                     now = now_market_time()
-                    log(f"Market collection inactive at {now:%Y-%m-%d %H:%M:%S %Z}. Waiting...")
-                    time.sleep(240)
+                    today = now.strftime("%Y-%m-%d")
+
+                    if browser is not None or edge_process is not None:
+                        log("Collection window closed. Stopping Edge to save resources.")
+                        stop_edge_debug(browser, edge_process)
+                        browser = None
+                        page = None
+                        edge_process = None
+                    
+                    if now.time() > COLLECTION_END and last_eod_processing_date != today:
+                        if run_end_of_day_processing():
+                            last_eod_processing_date = today
+                        else:
+                            log("End-of-day processing failed. WIll retry on next inactive loop.")
+                            time.sleep(300)
+                            continue
+                    
+                    sleep_until_next_trading_day()
                     continue
 
-                started = datetime.now()
-                log(f"\nPolling at {started:%Y-%m-%d %H:%M:%S}")
-
-                if not page_is_healthy(page):
-                    log("Current page appears stale. Restarting browser.")
-                    browser, page, edge_process = restart_edge_debug(p, browser, edge_process)
+                if browser is None or page is None:
+                    log("Collection window active. Starting Edge/Fidelity.")
+                    browser, page, edge_process = connect_and_prepare_page(p)
 
                     if browser is None or page is None:
-                        log("Could not recover stale page. Waiting before retry.")
+                        log("Could not prepare Edge/Fidelity. Wating 60 seconds.")
                         time.sleep(60)
                         continue
+
+                    sweep_count = 0
+                    consecutive_bad_sweeps = 0
                 
                 stats = SweepStats()
 
@@ -729,7 +919,7 @@ def main() -> None:
 
                         if browser is None or page is None:
                             log("Reconnect failed after bad-sweep restart.")
-                            time.sleep(POLL_SECONDS)
+                            sleep_until_next_bar_run()
                             continue
                     
                     consecutive_bad_sweeps = 0
@@ -745,9 +935,18 @@ def main() -> None:
 
                         if browser is None or page is None:
                             log("Reconnect failed. Skipping next cycle.")
-                            time.sleep(POLL_SECONDS)
+                            sleep_until_next_bar_run()
                             continue
-                time.sleep(POLL_SECONDS)
+
+                if not is_collection_time():
+                    log("Collection window ended after sweep. Closing Edge.")
+                    stop_edge_debug(browser, edge_process)
+                    browser = None
+                    page = None
+                    edge_process = None
+                    continue
+
+                sleep_until_next_bar_run()
 
         except KeyboardInterrupt:
             log("\nCollector stopped by user.")
